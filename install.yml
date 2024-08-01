@@ -1,0 +1,165 @@
+- name: Install cockroachDB
+  hosts: all
+  gather_facts: true
+  any_errors_fatal: true
+  vars:
+    db_version: 24.1.2
+  pre_tasks:
+  - name: Get PN and VPN ips
+    set_fact:
+      pn_addr: "{{ ansible_ens5.ipv4.address }}"
+      vpn_addr: "{{ ansible_wg0.ipv4.address }}"
+  - name: Update packages and reboot
+    become: true
+    become_user: root
+    block:
+    - name: Update packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+        state: latest
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: packages
+    - name: Reboot
+      reboot:
+        reboot_timeout: 600
+      when: packages.changed
+    - name: Purge unused
+      apt:
+        autoremove: yes
+        purge: yes
+    - name: Cleanup
+      apt:
+        autoclean: yes
+  - name: Base binary install
+    become: true
+    become_user: root
+    block:
+    - name: Copy base install script
+      copy:
+        src: "./base.sh"
+        dest: "/tmp/base.sh"
+        owner: "root"
+        group: "root"
+        mode: "0755"
+    - name: Base install
+      shell:
+        cmd: /tmp/base.sh {{ db_version }}
+        creates: "/var/lib/cockroach"
+  tasks:
+  - name: Generate CA and certs
+    become: true
+    become_user: cockroach
+    block:
+    - name: Generate CA
+      shell:
+        chdir: /var/lib/cockroach
+        cmd: cockroach cert create-ca --certs-dir=certs --ca-key=ca/ca.key
+        creates: /var/lib/cockroach/ca/ca.key
+      run_once: yes
+      delegate_to: par-1
+    - name: Zip CA
+      shell:
+        chdir: /var/lib/cockroach
+        cmd: zip -0r ca.zip ca certs
+        creates: /var/lib/cockroach/ca.zip
+      run_once: yes
+      delegate_to: par-1
+    - name: Fetch CA
+      fetch:
+        flat: true
+        src: /var/lib/cockroach/ca.zip
+        dest: "./"
+      run_once: yes
+      delegate_to: par-1
+    - name: Copy CA
+      copy:
+        src: "./ca.zip"
+        dest: /var/lib/cockroach/ca.zip
+        owner: cockroach
+        group: cockroach
+        mode: "preserve"
+      when: inventory_hostname != "par-1"
+    - name: Unzip CA
+      shell:
+        chdir: /var/lib/cockroach
+        cmd: unzip ca.zip
+        creates: /var/lib/cockroach/ca/ca.key
+      when: inventory_hostname != "par-1"
+    - name: Generate node certs
+      shell:
+        chdir: /var/lib/cockroach
+        cmd: |
+          cockroach cert create-node \
+          {{ inventory_hostname }} \
+          {{ ansible_host }}  \
+          localhost \
+          127.0.0.1 \
+          {{ vpn_addr }} \
+          {{ pn_addr }} \
+          {{ lb_addr }} \
+          --certs-dir=certs \
+          --ca-key=ca/ca.key
+        creates: /var/lib/cockroach/certs/node.key
+  - name: Configure and start service
+    become: true
+    become_user: root
+    block:
+    - name: Set join list in unit file
+      lineinfile:
+        path: "/etc/systemd/system/cockroachdb.service"
+        state: present
+        insertafter: "Type=notify"
+        search_string: "ExecStart="
+        line: "ExecStart=/usr/local/bin/cockroach start --certs-dir=certs --sql-addr={{ pn_addr }}:5432 --listen-addr={{ vpn_addr }} --http-addr={{ pn_addr }}:8080 --advertise-sql-addr={{ pn_addr }}:5432 --advertise-addr={{ vpn_addr }} --advertise-http-addr={{ pn_addr }}:8080 --join={{ groups['all'] | map('extract', hostvars, ['vpn_addr']) | join(',') }} --cache=.25 --max-sql-memory=.25 --locality={{ locality }} --store=/mnt/data"
+    - name: Start CockroachDB
+      systemd:
+        name: cockroachdb
+        state: started
+        enabled: true
+        daemon_reload: true
+  - name: Generate root cert and initialize
+    become: true
+    become_user: root
+    block:
+    - name: Create cert folder
+      file:
+        path: /root/certs
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+    - name: Generate root certificate and key
+      shell:
+        chdir: /root
+        cmd: |
+          cp /var/lib/cockroach/certs/ca.crt /root/certs/ca.crt && \
+          cockroach cert create-client root --certs-dir=certs --ca-key=/var/lib/cockroach/ca/ca.key
+        creates: /root/certs/client.root.key
+      run_once: yes
+      delegate_to: par-1
+  - name: Initialize cluster and create webadmin account
+    become: true
+    become_user: root
+    block:
+    - name: Initialize cluster
+      shell:
+        chdir: /root
+        cmd: cockroach init --certs-dir=certs --host="{{ vpn_addr }}" && touch .initialized
+        creates: /root/.initialized
+      run_once: yes
+      delegate_to: par-1
+      register: init
+    - name: Wait for initialization
+      pause:
+        prompt: "Waiting 30s"
+        seconds: "30"
+      when: init.changed
+    - name: Create webadmin account
+      shell:
+        chdir: /root
+        cmd: cockroach sql --certs-dir=certs --host="{{ pn_addr }}":5432 -e "CREATE USER webadmin WITH LOGIN PASSWORD '{{ webadmin_password }}'; GRANT admin TO webadmin;" && touch .account_created
+        creates: /root/.account_created
+      run_once: yes
+      delegate_to: par-1
